@@ -155,6 +155,7 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
+  heads_per_tile: int = 1
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -162,6 +163,8 @@ class SplashConfig:
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
 
+    if self.heads_per_tile < 1:
+      raise ValueError(f"Invalid heads_per_tile: {self.heads_per_tile}, expected >= 1.")
     if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
       raise ValueError(f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 3 or" " None are supported.")
     if not self.use_fused_bwd_kernel:
@@ -481,6 +484,116 @@ def flash_attention_kernel(
       assert max_logits_ref.shape == (bq, NUM_LANES)
       max_logits_ref[...] = m.astype(max_logits_ref.dtype)
 
+
+def flash_attention_kernel_mhpt(
+    # Prefetched inputs
+    active_rows_ref,
+    active_cols_ref,
+    mask_next_ref,
+    bounds_start_ref,
+    bounds_end_ref,
+    block_mask_ref,
+    # Inputs
+    q_ref,
+    k_ref,
+    v_ref,
+    q_segment_ids_ref,
+    kv_segment_ids_ref,
+    sinks_ref,
+    mask_ref,
+    q_sequence_ref,
+    max_logit_value_ref,
+    # Outputs
+    o_ref,
+    logsumexp_ref,
+    l_linear_ref,
+    max_logits_ref,
+    # Scratch
+    m_scratch_ref,
+    l_scratch_ref,
+    o_scratch_ref,
+    *,
+    mask_value: float,
+    kv_steps: int,
+    bq: int,
+    bkv: int,
+    bkv_compute: int,
+    head_dim_v: int,
+    heads_per_tile: int,
+    config: SplashConfig,
+):
+  del active_rows_ref, active_cols_ref, mask_next_ref
+  del bounds_start_ref, bounds_end_ref, block_mask_ref
+  del sinks_ref, mask_ref, q_sequence_ref, max_logit_value_ref
+
+  grid_idx = pl.program_id(1)
+  j = grid_idx % kv_steps
+  should_initialize = j == 0
+  should_write = j == kv_steps - 1
+  head_dim_v_repeats = pl.cdiv(head_dim_v, NUM_LANES)
+  exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+
+  @pl.when(should_initialize)
+  def init():
+    o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+
+  def body(kv_compute_index, _):
+    slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+    bkv_repeats, rem = divmod(bkv_compute, NUM_LANES)
+    if rem != 0:
+      raise NotImplementedError(f"{bkv_compute=} should be a multiple of {NUM_LANES}")
+
+    for h_local in range(heads_per_tile):
+      m_prev = m_scratch_ref[h_local]
+      l_prev = l_scratch_ref[h_local]
+      q = q_ref[h_local]
+      if config.use_base2_exp:
+        q *= LOG2E
+
+      qk = lax.dot_general(q, k_ref[h_local, slice_k, :], NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+      qk = _apply_mask_and_soft_cap(
+          qk,
+          mask_value,
+          None,
+          None,
+          q_segment_ids_ref,
+          kv_segment_ids_ref,
+          attn_logits_soft_cap=None,
+          k_slice=slice_k,
+          k_offset=j * bkv + kv_compute_index * bkv_compute,
+          bq=bq,
+          mask_function=None,
+          has_partial_mask=False,
+      )
+
+      m_curr = qk.max(axis=-1)[:, None]  # pytype: disable=attribute-error
+      m_next = jnp.maximum(m_prev, m_curr)
+      s_curr = exp(qk - jnp.tile(m_next, (1, bkv_repeats)))
+      l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
+      alpha = exp(m_prev - m_next)
+      m_scratch_ref[h_local] = m_next
+      l_scratch_ref[h_local] = l_curr + alpha * l_prev
+
+      o_curr = lax.dot_general(s_curr, v_ref[h_local, slice_k, :], NN_DIM_NUMBERS)
+      alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
+      alpha_o = alpha_o[..., : o_scratch_ref.shape[-1]]
+      o_scratch_ref[h_local] = alpha_o * o_scratch_ref[h_local] + o_curr
+
+  assert bkv % bkv_compute == 0
+  lax.fori_loop(0, k_ref.shape[1] // bkv_compute, body, None, unroll=True)
+
+  @pl.when(should_write)
+  def end():
+    for h_local in range(heads_per_tile):
+      l = l_scratch_ref[h_local]
+      m = m_scratch_ref[h_local]
+      o_ref[h_local] = o_scratch_ref[h_local].astype(o_ref.dtype)
+      if l_linear_ref is not None:
+        l_linear_ref[h_local] = l.astype(l_linear_ref.dtype)
+      if max_logits_ref is not None:
+        max_logits_ref[h_local] = m.astype(max_logits_ref.dtype)
 
 def _div(dividend: int, divisor: int):
   if divisor == 1:
@@ -918,6 +1031,9 @@ def _splash_attention_forward_ring_raw(
   kv_steps = kv_seq_len // bkv
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   dynamic_grid = mask_info.active_rows is not None
+  heads_per_tile = config.heads_per_tile
+  if num_q_heads % heads_per_tile != 0:
+    raise ValueError(f"num_q_heads {num_q_heads} must be divisible by heads_per_tile {heads_per_tile}.")
 
   if segment_ids is not None:
     assert isinstance(segment_ids.q, jax.Array)
@@ -940,6 +1056,33 @@ def _splash_attention_forward_ring_raw(
   q_layout = config.q_layout
   k_layout = config.k_layout
   v_layout = config.v_layout
+  use_heads_per_tile = heads_per_tile > 1
+  if use_heads_per_tile:
+    if dynamic_grid:
+      raise NotImplementedError("heads_per_tile > 1 is only implemented for static ring attention grids.")
+    if is_mqa:
+      raise NotImplementedError("heads_per_tile > 1 is only implemented for MHA ring attention.")
+    if (
+        mask_info.block_mask is not None
+        or mask_info.partial_mask_blocks is not None
+        or mask_info.q_sequence is not None
+        or mask_function is not None
+    ):
+      raise NotImplementedError("heads_per_tile > 1 is only implemented for static FullMask ring attention.")
+    if sinks is not None:
+      raise NotImplementedError("heads_per_tile > 1 does not support attention sinks.")
+    if max_logit_value is not None or config.max_logit_const is not None:
+      raise NotImplementedError("heads_per_tile > 1 does not support max logit bounds.")
+    if config.attn_logits_soft_cap is not None:
+      raise NotImplementedError("heads_per_tile > 1 does not support attention logit soft cap.")
+    if (
+        q_layout != QKVLayout.HEAD_DIM_MINOR
+        or k_layout != QKVLayout.HEAD_DIM_MINOR
+        or v_layout != QKVLayout.HEAD_DIM_MINOR
+    ):
+      raise NotImplementedError("heads_per_tile > 1 only supports HEAD_DIM_MINOR Q/K/V layouts.")
+  head_programs = num_q_heads // heads_per_tile
+  head_block = heads_per_tile if use_heads_per_tile else None
 
   def unravel(f):
     def index_map(h, grid_idx, rows_ref, cols_ref, *_):
@@ -953,16 +1096,21 @@ def _splash_attention_forward_ring_raw(
 
     return index_map
 
+  def head_index(h):
+    if use_heads_per_tile:
+      return h * heads_per_tile
+    return h
+
   def create_kv_index_map(layout):
     def index_map(h, i, j):
       del i
-      prefix = () if is_mqa else (_div(h, q_heads_per_kv_head),)
+      prefix = () if is_mqa else (_div(head_index(h), q_heads_per_kv_head),)
       return from_head_minor((*prefix, j, 0), layout)
 
     return index_map
 
-  q_index_map = unravel(lambda h, i, j: from_head_minor((h, i, 0), q_layout))
-  out_index_map = unravel(lambda h, i, j: (h, i, 0))
+  q_index_map = unravel(lambda h, i, j: from_head_minor((head_index(h), i, 0), q_layout))
+  out_index_map = unravel(lambda h, i, j: (head_index(h), i, 0))
   k_index_map = unravel(create_kv_index_map(k_layout))
   v_index_map = unravel(create_kv_index_map(v_layout))
 
@@ -975,13 +1123,13 @@ def _splash_attention_forward_ring_raw(
   kv_segment_ids_index_map = unravel(lambda h, i, j: (0, j))
 
   in_specs = [
-      pl.BlockSpec(from_head_minor((None, bq, head_dim_qk), q_layout), q_index_map),
+      pl.BlockSpec(from_head_minor((head_block, bq, head_dim_qk), q_layout), q_index_map),
       pl.BlockSpec(
-          from_head_minor((bkv, head_dim_qk) if is_mqa else (None, bkv, head_dim_qk), k_layout),
+          from_head_minor((bkv, head_dim_qk) if is_mqa else (head_block, bkv, head_dim_qk), k_layout),
           k_index_map,
       ),
       pl.BlockSpec(
-          from_head_minor((bkv, head_dim_v) if is_mqa else (None, bkv, head_dim_v), v_layout),
+          from_head_minor((bkv, head_dim_v) if is_mqa else (head_block, bkv, head_dim_v), v_layout),
           v_index_map,
       ),
   ]
@@ -1038,7 +1186,7 @@ def _splash_attention_forward_ring_raw(
   else:
     in_specs.append(None)
 
-  logsumexp_index_map = unravel(lambda h, i, j, *_: (h, i, 0))
+  logsumexp_index_map = unravel(lambda h, i, j, *_: (head_index(h), i, 0))
   out_shapes = [
       jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), jnp.float32),
       None,
@@ -1046,15 +1194,17 @@ def _splash_attention_forward_ring_raw(
       jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
   ]
   out_specs = [
-      pl.BlockSpec((None, bq, head_dim_v), out_index_map),
+      pl.BlockSpec((head_block, bq, head_dim_v), out_index_map),
       None,
-      pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map),
-      pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map),
+      pl.BlockSpec((head_block, bq, NUM_LANES), logsumexp_index_map),
+      pl.BlockSpec((head_block, bq, NUM_LANES), logsumexp_index_map),
   ]
 
   kernel_name = (
       f"{get_kernel_name(is_mqa=is_mqa, save_residuals=True, is_segmented=segment_ids is not None, phase='fwd')}_ring_raw"
   )
+  if use_heads_per_tile:
+    kernel_name = f"{kernel_name}_hpt{heads_per_tile}"
   metadata = {"xprof_metadata": json.dumps(dataclasses.asdict(config))}
 
   vmem_inputs = [q, k, v, q_segment_ids, kv_segment_ids, mask_info.partial_mask_blocks]
@@ -1087,36 +1237,48 @@ def _splash_attention_forward_ring_raw(
 
   if dynamic_grid:
     num_active_blocks = mask_info.num_active_blocks[0]
-    grid = (num_q_heads, num_active_blocks)
+    grid = (head_programs, num_active_blocks)
     is_empty_attention_block = num_active_blocks == 0
   else:
-    grid = (num_q_heads, kv_steps * (q_seq_len // bq))
+    grid = (head_programs, kv_steps * (q_seq_len // bq))
     is_empty_attention_block = False
+
+  kernel = flash_attention_kernel_mhpt if use_heads_per_tile else flash_attention_kernel
+  kernel_kwargs = {
+      "mask_value": mask_value,
+      "kv_steps": kv_steps,
+      "bq": bq,
+      "bkv": bkv,
+      "bkv_compute": bkv_compute,
+      "head_dim_v": head_dim_v,
+      "config": config,
+  }
+  if use_heads_per_tile:
+    kernel_kwargs["heads_per_tile"] = heads_per_tile
+  else:
+    kernel_kwargs["fuse_reciprocal"] = False
+    kernel_kwargs["mask_function"] = mask_function
+  scratch_shapes = [
+      pltpu.VMEM((bq, NUM_LANES), jnp.float32),
+      pltpu.VMEM((bq, NUM_LANES), jnp.float32),
+      pltpu.VMEM((bq, head_dim_v), jnp.float32),
+  ]
+  if use_heads_per_tile:
+    scratch_shapes = [
+        pltpu.VMEM((heads_per_tile, bq, NUM_LANES), jnp.float32),
+        pltpu.VMEM((heads_per_tile, bq, NUM_LANES), jnp.float32),
+        pltpu.VMEM((heads_per_tile, bq, head_dim_v), jnp.float32),
+    ]
 
   with jax.named_scope(kernel_name):
     all_out = pl.pallas_call(
-        partial(
-            flash_attention_kernel,
-            mask_value=mask_value,
-            kv_steps=kv_steps,
-            bq=bq,
-            bkv=bkv,
-            bkv_compute=bkv_compute,
-            head_dim_v=head_dim_v,
-            fuse_reciprocal=False,
-            config=config,
-            mask_function=mask_function,
-        ),
+        partial(kernel, **kernel_kwargs),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
             in_specs=in_specs,
             out_specs=out_specs,
             grid=grid,
-            scratch_shapes=[
-                pltpu.VMEM((bq, NUM_LANES), jnp.float32),
-                pltpu.VMEM((bq, NUM_LANES), jnp.float32),
-                pltpu.VMEM((bq, head_dim_v), jnp.float32),
-            ],
+            scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),

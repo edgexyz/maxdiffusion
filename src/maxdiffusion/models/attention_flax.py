@@ -344,6 +344,7 @@ def convert_to_tokamax_splash_config(
       max_logit_const=max_logit_const,
       interpret=interpret,
       dq_reduction_steps=dq_reduction_steps,
+      heads_per_tile=getattr(block_sizes, "heads_per_tile", None) or 1,
   )
 
 
