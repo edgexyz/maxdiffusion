@@ -1060,8 +1060,12 @@ def _splash_attention_forward_ring_raw(
   if use_heads_per_tile:
     if dynamic_grid:
       raise NotImplementedError("heads_per_tile > 1 is only implemented for static ring attention grids.")
-    if is_mqa:
-      raise NotImplementedError("heads_per_tile > 1 is only implemented for MHA ring attention.")
+    if is_mqa or q_heads_per_kv_head != 1:
+      # The mhpt head-dim BlockSpec tiles Q and K/V with the same head_block
+      # size, so the K/V block index must equal the Q head-tile index. That
+      # only holds for full MHA (num_q_heads == num_kv_heads); GQA/MQA would
+      # need a distinct K/V tiling. Matches custom_splash_attention.py's assert.
+      raise NotImplementedError("heads_per_tile > 1 is only implemented for MHA ring attention (num_q_heads == num_kv_heads).")
     if (
         mask_info.block_mask is not None
         or mask_info.partial_mask_blocks is not None
@@ -1096,21 +1100,22 @@ def _splash_attention_forward_ring_raw(
 
     return index_map
 
-  def head_index(h):
-    if use_heads_per_tile:
-      return h * heads_per_tile
-    return h
-
+  # `h` is program_id(0), which ranges over head *tiles* (grid dim 0 is
+  # num_q_heads // heads_per_tile). The head-dim BlockSpec block size is
+  # `head_block` (= heads_per_tile when tiling), so the block index is simply
+  # `h`: Pallas multiplies it by the block size to get the element offset
+  # (h * heads_per_tile). This matches the reference mhpt kernel in
+  # custom_splash_attention.py.
   def create_kv_index_map(layout):
     def index_map(h, i, j):
       del i
-      prefix = () if is_mqa else (_div(head_index(h), q_heads_per_kv_head),)
+      prefix = () if is_mqa else (_div(h, q_heads_per_kv_head),)
       return from_head_minor((*prefix, j, 0), layout)
 
     return index_map
 
-  q_index_map = unravel(lambda h, i, j: from_head_minor((head_index(h), i, 0), q_layout))
-  out_index_map = unravel(lambda h, i, j: (head_index(h), i, 0))
+  q_index_map = unravel(lambda h, i, j: from_head_minor((h, i, 0), q_layout))
+  out_index_map = unravel(lambda h, i, j: (h, i, 0))
   k_index_map = unravel(create_kv_index_map(k_layout))
   v_index_map = unravel(create_kv_index_map(v_layout))
 
@@ -1186,7 +1191,7 @@ def _splash_attention_forward_ring_raw(
   else:
     in_specs.append(None)
 
-  logsumexp_index_map = unravel(lambda h, i, j, *_: (head_index(h), i, 0))
+  logsumexp_index_map = unravel(lambda h, i, j, *_: (h, i, 0))
   out_shapes = [
       jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), jnp.float32),
       None,
